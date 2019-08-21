@@ -1,0 +1,5 @@
+name = Athena PDF export
+description = Adds article export functionality
+core = 7.x
+
+configure = admin/config/media/athenapdf

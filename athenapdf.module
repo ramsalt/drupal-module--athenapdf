@@ -1,146 +1,295 @@
 <?php
 
+define('ATHENAPDF_MAP_TABLE', 'athenapdf_node_map');
+
+define('ATHENAPDF_CONFIG_ERROR', 1);
+define('ATHENAPDF_CACHE_STORAGE_ERROR', 2);
+
+/*
+ * ############################## Drupal Hooks ##############################
+ *
+ * Functions listed below are implementing Drupal hooks.
+ *
+ */
+
+
 /**
  * Implements hook_menu().
  */
 function athenapdf_menu() {
-  $items = array();
+  $items = [];
 
-  $items['node/%node/pdf'] = array(
-    'title' => 'PDF Export',
-    'page callback' => 'athenapdf_view',
-    'page arguments' => array(1),
-    'access callback' => 'node_access',
-    'access arguments' => array('view', 1),
-    'type' => MENU_CALLBACK,
-    'file' => 'includes/node.pdf.inc',
-  );
-  $items['node/%node/pdf/html'] = array(
-    'title callback' => 'node_page_title',
-    'title arguments' => array(1),
-    'page callback' => 'node_page_view',
-    'page arguments' => array(1),
-    'access callback' => '_athenapdf_access',
-    'access arguments' => array(1),
-  );
+  $items['node/%node/pdf'] = [
+    'title'            => 'PDF Export',
+    'page callback'    => 'athenapdf_view_node_page',
+    'page arguments'   => [1],
+    'file'             => 'athenapdf.callbacks.inc',
+    'access callback'  => 'node_access',
+    'access arguments' => ['view', 1],
+    'type'             => MENU_LOCAL_TASK,
+  ];
 
-  $items['admin/config/media/athenapdf'] = array(
-    'title' => 'Athenapdf',
-    'description' => 'Configuration for Athenapdf',
-    'page callback' => 'drupal_get_form',
-    'page arguments' => array('athenapdf_admin_form'),
-    'access callback' => '_athenapdf_access',
-    'access arguments'  => array('administer site configuration', 1),
-    'type' => MENU_NORMAL_ITEM,
-  );
+  $items['node/%node/pdf/generate'] = [
+    'title callback'   => 'node_page_title',
+    'title arguments'  => [1],
+    'page callback'    => 'node_page_view',
+    'page arguments'   => [1],
+    'access callback'  => 'athenapdf_generate_node_pdf_access',
+    'access arguments' => [1],
+  ];
+
+  $items['admin/config/media/athenapdf'] = [
+    'title'            => 'AthenaPDF Configuration',
+    'description'      => 'Configuration for AthenaPDF module',
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => ['athenapdf_admin_form'],
+    'file'             => 'athenapdf.admin.inc',
+    'access arguments' => ['administer site configuration'],
+  ];
 
   return $items;
 }
 
 /**
- * Page callback: Athenapdf settings
- *
- * @see athenapdf_menu()
+ * Implements hook_permission().
  */
-function athenapdf_admin_form($form, &$form_state) {
-  $file_option = array(
-    'private' => t('Private files'),
-  );
+function athenapdf_permission() {
+  return [];
+}
 
-  $form['private_files_form'] = array(
-    '#type' => 'checkboxes',
-    '#title' => t('Save pdfs in private directory'),
-    '#default_value' => variable_get('private_files_form', 0),
-    '#description' => t('Option to save the pdfs files in the private file directory'),
-    '#options' => $file_option,
-  );
+/**
+ * Implements hook_node_update().
+ * Deletes the existing cached PDF from the map index.
+ */
+function athenapdf_node_update($node) {
+  // No Node ID = Nothing to do.
+  if (empty($node->nid)) {
+    return;
+  }
 
-  return system_settings_form($form);
+  // Delete existing file in Drupal.
+  $fid = athenapdf_get_cached_file($node->nid);
+  if ($fid && $file = file_load($fid)) {
+    file_delete($file);
+  }
+
+  // Delete mapping from our table.
+  $existing = db_delete(ATHENAPDF_MAP_TABLE)
+    ->condition('nid', $node->nid)
+    ->execute();
+}
+
+
+/*
+ * ############################## Public Toolbox ##############################
+ *
+ * Functions listed in this section can be freely called by other modules.
+ *
+ */
+
+
+/**
+ * Returns a File for a given Node.
+ *
+ * @param int $nid
+ *   The Node ID.
+ *
+ * @return int|false
+ *   The File ID or FALSE if not found.
+ */
+function athenapdf_get_cached_file($nid) {
+  // Force integer value for NodeID..
+  if (!is_int($nid)) {
+    $nid = intval($nid);
+  }
+
+  // Load the mapping and return the FileID, if exists.
+  $fid_list = athenapdf_get_cached_file_multiple([$nid]);
+  return $fid_list[$nid] ?? FALSE;
+}
+
+/**
+ * Gets a list of cached pdf Files for the given Nodes.
+ *
+ * @param array $nid_list
+ *   List of Node IDs (nid).
+ *
+ * @return array
+ *   List of File IDs indexed by respective Node ID.
+ */
+function athenapdf_get_cached_file_multiple(array $nid_list) {
+  $query = db_select(ATHENAPDF_MAP_TABLE, 'm')
+    ->fields('m', ['nid', 'fid'])
+    ->condition('nid', $nid_list)
+    ->execute();
+
+  if ($query && !is_a($query, DatabaseStatementEmpty::class)) {
+    return $query->fetchAllKeyed();
+  }
+
+  return [];
+}
+
+/**
+ * Creates and stores a PDF for a given node.
+ *
+ * @param \stdClass $node
+ *   The currently processed node object.
+ *
+ * @return \stdClass|false
+ *   File object or false on failure.
+ */
+function athenapdf_create_for_node(\stdClass $node) {
+  // Create the article export pdf.
+  $pdf_data = _athenapdf_process_node($node);
+
+  $cache_schema = variable_get('athenapdf_storage_type', 'public');
+  $cache_directory = $cache_schema . '://athenapdf_cache';
+
+  if (!file_prepare_directory($cache_directory, FILE_CREATE_DIRECTORY)) {
+    throw new RuntimeException(
+      'Could not create pdf cache directory',
+      ATHENAPDF_CACHE_STORAGE_ERROR
+    );
+  }
+
+  $file = file_save_data(
+    $pdf_data,
+    "{$cache_directory}/node-{$node->nid}.pdf",
+    FILE_EXISTS_REPLACE
+  );
+  _athenapdf_store_file_association($node->nid, $file->fid);
+
+  return $file;
+}
+
+
+/*
+ * ############################## Private Toolbox ##############################
+ *
+ * Functions listed below are to be considered internal and not used in other modules.
+ *
+ */
+
+/**
+ * Stores the association of a Node and a File in the AthenaPDF cache mapping.
+ *
+ * @param $nid
+ * @param $fid
+ *
+ * @return bool
+ *   Success or faillure.
+ */
+function _athenapdf_store_file_association($nid, $fid) {
+  try {
+    return (bool) db_merge(ATHENAPDF_MAP_TABLE)
+      ->fields(
+        [
+          'nid' => $nid,
+          'fid' => $fid,
+        ]
+      )
+      ->key(['nid' => $nid])
+      ->execute();
+  }
+  catch (Exception $e) {
+    watchdog_exception('athenapdf', $e);
+  }
+
+  return FALSE;
 }
 
 /**
  * Grant PDF creation access for user, with update permission or a token.
  */
-function _athenapdf_access($node) {
+function athenapdf_generate_node_pdf_access($node) {
   // Check if the user requested the URL with a athenapdf token and validate it.
-  $query_parameters = drupal_get_query_parameters();
-  if (isset($query_parameters['athenapdf_token']) && $query_parameters['athenapdf_token'] === variable_get('athenapdf_secret')) {
-    return TRUE;
+  $auth_key_parameter = drupal_get_query_parameters(
+                        )['athenapdf_token'] ?? FALSE;
+  $athenapdf_weaver_key = variable_get('athenapdf_weaver_key');
+
+  if ($auth_key_parameter && $auth_key_parameter === $athenapdf_weaver_key) {
+    // Pass the access check to the standard node function.
+    return node_access('view', $node);
   }
 
-  // Otherwise deny the access.
+  // Default: Deny access.
   return FALSE;
 }
 
-function athenapdf_node_update($node) {
-  db_delete('pdf_export_files')
-    ->condition('nid', $node->nid)
-    ->execute();
-}
-
 /**
- * Shows a pdf generated if existing on the node or generate it.
+ * Prints the content of a cached PDF file.
  *
- * @param $node
- *   The currently processed node object.
- *
- * @return bool|stdClass
- *   File object or false on failure.
+ * @param \stdClass $file
+ * @param string $filename
  */
-function athenapdf_view ($node) {
-  if($fid = $node->pdf_export) {
-    // File is already genereated. Show it.
-    $file = file_load($fid);
-    athenapdf_view_file($file, $node);
-  } else {
-    if($file = athenapdf_create_file($node)) {
-      db_insert('pdf_export_files')
-      ->fields(array(
-        'nid' => $node->nid,
-        'fid' => $file->fid,
-        'created' => REQUEST_TIME,
-      ))->execute();
-
-      watchdog('pdf_export', t('Generated PDF-file: %fid for node %nid', ['%fid'=> $file->fid, '%nid'=>$node->nid]));
-
-      athenapdf_view_file($file, $node);
-    }
-  }
-}
-
-function athenapdf_view_file ($file, $node) {
+function _athenapdf_view_cached_pdf_content(
+  \stdClass $file,
+  string $filename = 'file.pdf'
+) {
   header('Content-type: application/pdf');
-  header('Content-Disposition: inline; filename="pdf-export-' . $node->nid . '.pdf"');
+  header("Content-Disposition: inline; filename=\"{$filename}\"");
   header('Content-Transfer-Encoding: binary');
   header('Accept-Ranges: bytes');
 
-  print file_get_contents(drupal_realpath($file->uri));
+  print file_get_contents(
+    drupal_realpath($file->uri)
+  );
   drupal_exit();
 }
 
+
 /**
- * Creates and store PDF export file.
+ * Sends a request for the node to a AthenaPDF endpoint and the PDF.
  *
  * @param $node
- *   The currently processed node object.
+ *   Node object.
+ * @param string $output_type
+ *   Defines the output type for FPDF class. Default: send to browser as file
+ *   stream.
  *
- * @return bool|stdClass
- *   File object or false on failure.
+ * @return mixed
  */
-function athenapdf_create_file($node) {
-  // Create the article export pdf.
-  module_load_include('inc', 'athenapdf', 'includes/node.pdf');
-  try {
-    $pdf = athenapdf_process_node($node, 'S');
-  } catch (Exception $e) {
-    drupal_set_message(t('The PDF was not saved. Error: @error_message', array('@error_message' => $e->getMessage())));
-    return FALSE;
+function _athenapdf_process_node($node) {
+  global $base_url;
+
+  $front_base_url = variable_get('athenapdf_front_domain', $base_url);
+  $weaver_domain = variable_get('athenapdf_weaver_domain');
+  $weaver_key = variable_get('athenapdf_weaver_key');
+
+  if (empty($weaver_key) || empty($weaver_domain)) {
+    throw new RuntimeException(
+      'AthenaPDF is not properly configured',
+      ATHENAPDF_CONFIG_ERROR
+    );
   }
 
-  // Save the returned pdf stream.
-  // TODO Create checkbox in the module to allow store it in public or private
-  $pdfDir = 'public://pdf-export';
-  file_prepare_directory($pdfDir, FILE_CREATE_DIRECTORY);
-  $destination = $pdfDir.'/pdf-export-' . $node->nid . '.pdf';
-  return file_save_data($pdf, $destination, FILE_EXISTS_REPLACE);
+  $athenapdf_query = [
+    'auth' => $weaver_key,
+    'url'  => "{$front_base_url}/node/{$node->nid}/pdf/generate?athenapdf_token={$weaver_key}",
+  ];
+  $request_options = [
+    'method'  => 'GET',
+    'timeout' => 30,
+  ];
+  $request_url = $weaver_domain . '/convert?' . drupal_http_build_query(
+      $athenapdf_query
+    );
+
+  $response = drupal_http_request($request_url, $request_options);
+  if (intval($response->code) !== 200) {
+    throw new RuntimeException(
+      "Error {$response->code}. Data: {$response->data}", $response->code
+    );
+  }
+
+  return $response->data;
 }
+
+
+
+
+
+
+
+

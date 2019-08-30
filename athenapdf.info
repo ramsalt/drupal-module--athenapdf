@@ -1,5 +1,5 @@
 name = Athena PDF export
-description = Adds article export functionality
+description = Adds node pdf export functionality via an AthenaPDF Waver daemon
 core = 7.x
 
 configure = admin/config/media/athenapdf
